@@ -16,19 +16,33 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
         address seller;
         uint256 price;
         bool isActive;
+        uint256 listingTime; // 上架时间
+        uint256 expirationTime; // 过期时间
     }
     
     // 平台费用比例（2%）
     uint256 public platformFee;
     uint256 public constant BASIS_POINTS = 10000;
     
+    // 默认过期区块数量
+    uint256 public defaultExpirationBlocks;
+    // 看板最大容量
+    uint256 public maxBoardCapacity;
+    
     // 存储所有上架的NFT
     mapping(uint256 => Listing) public listings;
+    // 存储用户拥有的NFT列表
+    mapping(address => uint256[]) private userAssets;
+    // 用户NFT索引映射（用于优化删除操作）
+    mapping(address => mapping(uint256 => uint256)) private userAssetIndices;
+    // 看板上的NFT列表
+    uint256[] public boardListings;
     
     // 事件定义
-    event NFTListed(uint256 indexed tokenId, address indexed seller, uint256 price);
+    event NFTListed(uint256 indexed tokenId, address indexed seller, uint256 price, uint256 expirationTime);
     event NFTSold(uint256 indexed tokenId, address indexed seller, address indexed buyer, uint256 price);
     event NFTListingCancelled(uint256 indexed tokenId, address indexed seller);
+    event NFTListingExpired(uint256 indexed tokenId, address indexed seller);
     
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -41,10 +55,22 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
         __UUPSUpgradeable_init();
         nftContract = NFT(_nftContract);
         platformFee = 200; // 2%
+        defaultExpirationBlocks = 500; // 默认500个区块后过期
+        maxBoardCapacity = 100; // 最大看板容量
     }
     
     // NFT上架函数
     function listNFT(uint256 tokenId, uint256 price) external {
+        return _listNFT(tokenId, price, block.number + defaultExpirationBlocks);
+    }
+    
+    // 自定义过期时间的NFT上架函数
+    function listNFTWithExpiration(uint256 tokenId, uint256 price, uint256 expirationBlocks) external {
+        return _listNFT(tokenId, price, block.number + expirationBlocks);
+    }
+    
+    // 内部上架函数
+    function _listNFT(uint256 tokenId, uint256 price, uint256 expirationTime) internal {
         require(nftContract.ownerOf(tokenId) == msg.sender, "Not the owner");
         require(price > 0, "Price must be greater than 0");
         
@@ -55,16 +81,22 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
         listings[tokenId] = Listing({
             seller: msg.sender,
             price: price,
-            isActive: true
+            isActive: true,
+            listingTime: block.number,
+            expirationTime: expirationTime
         });
         
-        emit NFTListed(tokenId, msg.sender, price);
+        // 添加到看板
+        _addToBoard(tokenId);
+        
+        emit NFTListed(tokenId, msg.sender, price, expirationTime);
     }
     
     // 购买NFT函数
     function buyNFT(uint256 tokenId) external payable nonReentrant {
         Listing storage listing = listings[tokenId];
         require(listing.isActive, "Listing is not active");
+        require(block.number <= listing.expirationTime, "Listing has expired");
         require(msg.value >= listing.price, "Insufficient payment");
         
         // 计算平台费用
@@ -74,12 +106,24 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
         // 转移NFT给买家
         nftContract.transferFrom(address(this), msg.sender, tokenId);
         
+        // 添加到买家资产列表
+        _addToUserAssets(msg.sender, tokenId);
+        
+        // 从卖家资产列表中移除
+        _removeFromUserAssets(listing.seller, tokenId);
+        
         // 转移资金
         payable(listing.seller).transfer(sellerAmount);
         payable(owner()).transfer(platformFeeAmount);
         
         // 更新上架状态
         listing.isActive = false;
+        
+        // 从看板中移除
+        _removeFromBoard(tokenId);
+        
+        // 处理过期的NFT
+        _processExpiredListings();
         
         emit NFTSold(tokenId, listing.seller, msg.sender, listing.price);
     }
@@ -96,7 +140,127 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
         // 更新上架状态
         listing.isActive = false;
         
+        // 从看板中移除
+        _removeFromBoard(tokenId);
+        
         emit NFTListingCancelled(tokenId, msg.sender);
+    }
+    
+    // 处理过期的NFT上架
+    function _processExpiredListings() internal {
+        uint256 processCount = 0;
+        uint256 maxToProcess = 5; // 限制每次处理的数量以避免gas过高
+        
+        for (uint256 i = 0; i < boardListings.length && processCount < maxToProcess; i++) {
+            uint256 tokenId = boardListings[i];
+            Listing storage listing = listings[tokenId];
+            
+            if (listing.isActive && block.number > listing.expirationTime) {
+                // 返还NFT给卖家
+                nftContract.transferFrom(address(this), listing.seller, tokenId);
+                
+                // 更新上架状态
+                listing.isActive = false;
+                
+                // 从看板中移除
+                _removeFromBoard(tokenId);
+                
+                emit NFTListingExpired(tokenId, listing.seller);
+                
+                processCount++;
+                // 因为我们删除了一个元素，所以需要减少索引
+                i--;
+            }
+        }
+    }
+    
+    // 手动清理过期的NFT上架（可由任何人调用）
+    function processExpiredListings(uint256 maxToProcess) external {
+        uint256 processCount = 0;
+        
+        for (uint256 i = 0; i < boardListings.length && processCount < maxToProcess; i++) {
+            uint256 tokenId = boardListings[i];
+            Listing storage listing = listings[tokenId];
+            
+            if (listing.isActive && block.number > listing.expirationTime) {
+                // 返还NFT给卖家
+                nftContract.transferFrom(address(this), listing.seller, tokenId);
+                
+                // 更新上架状态
+                listing.isActive = false;
+                
+                // 从看板中移除
+                _removeFromBoard(tokenId);
+                
+                emit NFTListingExpired(tokenId, listing.seller);
+                
+                processCount++;
+                // 因为我们删除了一个元素，所以需要减少索引
+                i--;
+            }
+        }
+    }
+    
+    // 添加到看板
+    function _addToBoard(uint256 tokenId) internal {
+        // 检查看板容量
+        if (boardListings.length >= maxBoardCapacity) {
+            // 如果超出容量，处理过期的NFT
+            _processExpiredListings();
+            // 如果仍然超出容量，则移除最早的一个
+            if (boardListings.length >= maxBoardCapacity) {
+                uint256 oldestTokenId = boardListings[0];
+                Listing storage oldestListing = listings[oldestTokenId];
+                
+                // 返还NFT给卖家
+                nftContract.transferFrom(address(this), oldestListing.seller, oldestTokenId);
+                
+                // 更新上架状态
+                oldestListing.isActive = false;
+                
+                // 从看板中移除
+                _removeFromBoard(oldestTokenId);
+                
+                emit NFTListingExpired(oldestTokenId, oldestListing.seller);
+            }
+        }
+        
+        // 添加到看板
+        boardListings.push(tokenId);
+    }
+    
+    // 从看板中移除
+    function _removeFromBoard(uint256 tokenId) internal {
+        for (uint256 i = 0; i < boardListings.length; i++) {
+            if (boardListings[i] == tokenId) {
+                // 将最后一个元素移到当前位置
+                boardListings[i] = boardListings[boardListings.length - 1];
+                // 移除最后一个元素
+                boardListings.pop();
+                break;
+            }
+        }
+    }
+    
+    // 添加到用户资产列表
+    function _addToUserAssets(address user, uint256 tokenId) internal {
+        userAssets[user].push(tokenId);
+        userAssetIndices[user][tokenId] = userAssets[user].length - 1;
+    }
+    
+    // 从用户资产列表中移除
+    function _removeFromUserAssets(address user, uint256 tokenId) internal {
+        uint256 index = userAssetIndices[user][tokenId];
+        uint256 lastIndex = userAssets[user].length - 1;
+        
+        if (index != lastIndex) {
+            uint256 lastTokenId = userAssets[user][lastIndex];
+            userAssets[user][index] = lastTokenId;
+            userAssetIndices[user][lastTokenId] = index;
+        }
+        
+        userAssets[user].pop();
+        delete userAssetIndices[user][tokenId];
     }
     
     // 查看NFT上架信息
@@ -104,10 +268,40 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
         return listings[tokenId];
     }
     
+    // 查询我的资产（单个人的资产）
+    function getMyAssets() external view returns (uint256[] memory) {
+        return getUserAssets(msg.sender);
+    }
+    
+    // 查询指定用户的资产
+    function getUserAssets(address user) public view returns (uint256[] memory) {
+        return userAssets[user];
+    }
+    
+    // 查询资产所有者
+    function getAssetOwner(uint256 tokenId) external view returns (address) {
+        return nftContract.ownerOf(tokenId);
+    }
+    
+    // 获取看板上的所有NFT
+    function getBoardListings() external view returns (uint256[] memory) {
+        return boardListings;
+    }
+    
     // 修改平台费用比例（仅合约所有者可调用）
     function setPlatformFee(uint256 _platformFee) external onlyOwner {
         require(_platformFee <= 1000, "Fee too high"); // 最高10%
         platformFee = _platformFee;
+    }
+    
+    // 修改默认过期区块数量
+    function setDefaultExpirationBlocks(uint256 _blocks) external onlyOwner {
+        defaultExpirationBlocks = _blocks;
+    }
+    
+    // 修改看板最大容量
+    function setMaxBoardCapacity(uint256 _capacity) external onlyOwner {
+        maxBoardCapacity = _capacity;
     }
 
     // UUPS升级函数
