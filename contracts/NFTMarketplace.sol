@@ -16,8 +16,8 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
         address seller;
         uint256 price;
         bool isActive;
-        uint256 listingTime; // 上架时间
-        uint256 expirationTime; // 过期时间
+        uint256 listingBlock; // 上架区块
+        uint256 expirationBlock; // 过期区块
     }
     
     // 平台费用比例（5%）
@@ -33,13 +33,13 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
     mapping(uint256 => Listing) public listings;
     // 存储用户拥有的NFT列表
     mapping(address => uint256[]) private userAssets;
-    // 用户NFT索引映射（用于优化删除操作）
+    // 用户NFT索引映射（用于优化删除操作） 
     mapping(address => mapping(uint256 => uint256)) private userAssetIndices;
     // 看板上的NFT列表
     uint256[] public boardListings;
     
     // 事件定义
-    event NFTListed(uint256 indexed tokenId, address indexed seller, uint256 price, uint256 expirationTime);
+    event NFTListed(uint256 indexed tokenId, address indexed seller, uint256 price, uint256 expirationBlocks);
     event NFTSold(uint256 indexed tokenId, address indexed seller, address indexed buyer, uint256 price);
     event NFTListingCancelled(uint256 indexed tokenId, address indexed seller);
     event NFTListingExpired(uint256 indexed tokenId, address indexed seller);
@@ -62,16 +62,16 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
     
     // NFT上架函数
     function listNFT(uint256 tokenId, uint256 price) external {
-        return _listNFT(tokenId, price, block.number + defaultExpirationBlocks);
+        _listNFT(tokenId, price, defaultExpirationBlocks);
     }
     
     // 自定义过期时间的NFT上架函数
-    function listNFTWithExpiration(uint256 tokenId, uint256 price, uint256 duration) external {
-        return _listNFT(tokenId, price, duration);
+    function listNFTWithExpiration(uint256 tokenId, uint256 price, uint256 expirationBlocks) external {
+        _listNFT(tokenId, price, expirationBlocks);
     }
     
     // 内部上架函数
-    function _listNFT(uint256 tokenId, uint256 price, uint256 expirationTime) internal {
+    function _listNFT(uint256 tokenId, uint256 price, uint256 expirationBlocks) internal {
         require(nftContract.ownerOf(tokenId) == msg.sender, "Not token owner");
         require(price > 0, "Price must be greater than 0");
         
@@ -83,24 +83,23 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
             seller: msg.sender,
             price: price,
             isActive: true,
-            listingTime: block.timestamp,
-            expirationTime: block.timestamp + expirationTime
+            listingBlock: block.number,
+            expirationBlock: block.number + expirationBlocks
         });
         
-        // 添加到看板
+        // 将NFT添加到用户资产列表
+        _addToUserAssets(msg.sender, tokenId);
+        // 将NFT添加到看板
         _addToBoard(tokenId);
         
-        // 添加到卖家资产列表
-        _addToUserAssets(msg.sender, tokenId);
-        
-        emit NFTListed(tokenId, msg.sender, price, expirationTime);
+        emit NFTListed(tokenId, msg.sender, price, expirationBlocks);
     }
     
     // 购买NFT函数
     function buyNFT(uint256 tokenId) external payable nonReentrant {
         Listing storage listing = listings[tokenId];
         require(listing.isActive, "NFT not listed");
-        require(block.timestamp <= listing.expirationTime, "Listing has expired");
+        require(block.number <= listing.expirationBlock, "Listing has expired");
         require(msg.value == listing.price, "Incorrect price");
         
         // 计算平台费用
@@ -170,7 +169,7 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
             uint256 tokenId = boardListings[i];
             Listing storage listing = listings[tokenId];
             
-            if (listing.isActive && block.timestamp > listing.expirationTime) {
+            if (listing.isActive && block.number > listing.expirationBlock) {
                 // 返还NFT给卖家
                 nftContract.transferFrom(address(this), listing.seller, tokenId);
                 
@@ -197,7 +196,7 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
             uint256 tokenId = boardListings[i];
             Listing storage listing = listings[tokenId];
             
-            if (listing.isActive && block.timestamp > listing.expirationTime) {
+            if (listing.isActive && block.number > listing.expirationBlock) {
                 // 返还NFT给卖家
                 nftContract.transferFrom(address(this), listing.seller, tokenId);
                 
@@ -332,4 +331,4 @@ contract NFTMarketplace is Initializable, ReentrancyGuardUpgradeable, OwnableUpg
 
     // UUPS升级函数
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
-} 
+}
